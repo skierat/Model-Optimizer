@@ -17,6 +17,7 @@
 
 import copy
 import itertools
+import json
 import os
 
 import torch
@@ -82,15 +83,51 @@ class ShardedDataset(torch.utils.data.Dataset):
             data_dir = data_files
             data_files = None
 
-        dataset = load_dataset(
-            self.name,
-            self.subset,
-            data_files=data_files,
-            data_dir=data_dir,
-            split=self.split,
-            # num_proc=4,  # TODO: Make this configurable
-            streaming=self.num_streaming_samples is not None,
-        )
+        try:
+            dataset = load_dataset(
+                self.name,
+                self.subset,
+                data_files=data_files,
+                data_dir=data_dir,
+                split=self.split,
+                # num_proc=4,  # TODO: Make this configurable
+                streaming=self.num_streaming_samples is not None,
+            )
+        except Exception as exc:
+            # PAI + VQA is intentionally a heterogeneous JSONL: user content has a
+            # video field for one source and an image field for the other. Arrow can
+            # reject that schema or coerce a valid list to None. Keep this recovery
+            # narrow so unrelated dataset-loading failures remain visible.
+            if (
+                self.name != "json"
+                or self.num_streaming_samples is not None
+                or data_dir is not None
+                or data_files is None
+            ):
+                raise
+
+            files = data_files if isinstance(data_files, list) else [data_files]
+            if not all(isinstance(path, str) and os.path.isfile(path) for path in files):
+                raise
+
+            print_rank_0(
+                f"load_dataset raised {type(exc).__name__}: {exc}\n"
+                "Falling back to line-by-line JSONL loading to preserve heterogeneous records."
+            )
+            rows = []
+            for path in files:
+                with open(path, encoding="utf-8") as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if line:
+                            rows.append(json.loads(line))
+
+            self._raw_samples = rows[self.shard_index :: self.num_shards]
+            print_rank_0(
+                f"Loaded {len(rows)} JSONL records; {len(self._raw_samples)} assigned to "
+                f"shard {self.shard_index}/{self.num_shards}."
+            )
+            return
 
         shard = dataset.shard(num_shards=self.num_shards, index=self.shard_index)
 
@@ -316,7 +353,7 @@ class LanguageDataCollator:
 
 
 class VisionLanguageDataCollator(LanguageDataCollator):
-    """VisionLanguageDataCollator is a subclass of LanguageDataCollator that is used to collate vision-language data."""
+    """Collate multimodal conversations for online speculative-decoding training."""
 
     def __init__(
         self,
@@ -325,11 +362,35 @@ class VisionLanguageDataCollator(LanguageDataCollator):
         chat_template: str | None = None,
         add_generation_prompt: bool = False,
         answer_only_loss: bool = False,
+        shift_labels: bool = True,
         local_image_path: str = "",
         return_labels: bool = False,
     ):
-        """Initialize the VisionLanguageDataset."""
-        self.processor = transformers.AutoProcessor.from_pretrained(processor)
+        """Initialize a VLM processor and its fixed-length training collator.
+
+        ``VLM_MIN_PIXELS`` and ``VLM_MAX_PIXELS`` constrain image processing.  Qwen3-VL
+        has a separate video processor in Transformers 5.3, so the same limits are also
+        applied there unless ``VLM_VIDEO_MIN_PIXELS`` or ``VLM_VIDEO_MAX_PIXELS`` is set.
+        """
+        processor_kwargs = {}
+        for environment_name, argument_name in (
+            ("VLM_MIN_PIXELS", "min_pixels"),
+            ("VLM_MAX_PIXELS", "max_pixels"),
+        ):
+            value = os.environ.get(environment_name)
+            if value is None:
+                continue
+            try:
+                processor_kwargs[argument_name] = int(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{environment_name} must be an integer, got {value!r}"
+                ) from exc
+
+        self.processor = transformers.AutoProcessor.from_pretrained(processor, **processor_kwargs)
+        if processor_kwargs:
+            print_rank_0(f"Loaded VLM processor with {processor_kwargs}")
+        self._configure_video_processor(self.processor, processor_kwargs)
         self.chat_template = chat_template
         self.local_image_path = local_image_path
         self._conversations_warned = False
@@ -340,26 +401,243 @@ class VisionLanguageDataCollator(LanguageDataCollator):
             chat_template=chat_template,
             add_generation_prompt=add_generation_prompt,
             answer_only_loss=answer_only_loss,
+            shift_labels=shift_labels,
             return_labels=return_labels,
         )
+        # Processor.apply_chat_template() uses the processor-level template, whereas the
+        # base collator installs an optional training override on its tokenizer.
+        self.processor.chat_template = self.tokenizer.chat_template
 
-    def _process_multimodal_sample(self, examples):
+    @staticmethod
+    def _configure_video_processor(processor, image_pixel_bounds):
+        """Apply visual pixel limits to a processor's separate video component.
+
+        Transformers 5.3 forwards ``min_pixels``/``max_pixels`` to Qwen3-VL's image
+        processor only.  Without this adjustment, the video processor retains its model
+        default (25M pixels for Cosmos Nano), which can make one video exceed the training
+        sequence length despite a launcher-level VLM_MAX_PIXELS setting.
+        """
+        video_processor = getattr(processor, "video_processor", None)
+        video_pixel_bounds = {}
+        has_explicit_video_bound = False
+        for environment_name, size_name, image_name in (
+            ("VLM_VIDEO_MIN_PIXELS", "shortest_edge", "min_pixels"),
+            ("VLM_VIDEO_MAX_PIXELS", "longest_edge", "max_pixels"),
+        ):
+            value = os.environ.get(environment_name)
+            if value is None:
+                value = image_pixel_bounds.get(image_name)
+            else:
+                has_explicit_video_bound = True
+                try:
+                    value = int(value)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{environment_name} must be an integer, got {value!r}"
+                    ) from exc
+            if value is not None:
+                video_pixel_bounds[size_name] = value
+
+        if has_explicit_video_bound and video_processor is None:
+            raise ValueError(
+                "VLM_VIDEO_MIN_PIXELS/VLM_VIDEO_MAX_PIXELS were set, but the configured "
+                "VLM processor has no video_processor."
+            )
+        if video_processor is None or not video_pixel_bounds:
+            return
+
+        video_size = dict(getattr(video_processor, "size", {}))
+        video_size.update(video_pixel_bounds)
+        minimum = video_size.get("shortest_edge")
+        maximum = video_size.get("longest_edge")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError("VLM_VIDEO_MIN_PIXELS must not exceed VLM_VIDEO_MAX_PIXELS.")
+        video_processor.size = video_size
+        print_rank_0(f"Configured VLM video processor with {video_size}")
+
+    def _verify_generation_tags(self):
+        """Allow VLM templates whose assistant spans can be read from chat markers."""
+        if self._assistant_marker_specs():
+            return
+        super()._verify_generation_tags()
+
+    def _encode_chat_marker(self, marker: str) -> list[int]:
+        return list(self.tokenizer(marker, add_special_tokens=False)["input_ids"])
+
+    def _assistant_marker_specs(self) -> list[tuple[list[int], list[list[int]]]]:
+        """Return token boundaries for the common ChatML and Llama assistant turns."""
+        if hasattr(self, "_cached_assistant_marker_specs"):
+            return self._cached_assistant_marker_specs
+
+        template = self.tokenizer.chat_template or ""
+        specs = []
+        if "<|im_start|>" in template and "<|im_end|>" in template:
+            specs.append(
+                (
+                    self._encode_chat_marker("<|im_start|>assistant\n"),
+                    [
+                        self._encode_chat_marker("<|im_end|>\n"),
+                        self._encode_chat_marker("<|im_end|>"),
+                    ],
+                )
+            )
+        if "<|start_header_id|>" in template and "<|eot_id|>" in template:
+            specs.append(
+                (
+                    self._encode_chat_marker(
+                        "<|start_header_id|>assistant<|end_header_id|>\n\n"
+                    ),
+                    [self._encode_chat_marker("<|eot_id|>")],
+                )
+            )
+
+        self._cached_assistant_marker_specs = [
+            (start, [end for end in end_markers if end])
+            for start, end_markers in specs
+            if start and any(end_markers)
+        ]
+        return self._cached_assistant_marker_specs
+
+    @staticmethod
+    def _find_subsequence(
+        values: list[int], pattern: list[int], start: int = 0, stop: int | None = None
+    ) -> int:
+        stop = len(values) if stop is None else stop
+        if not pattern or start >= stop:
+            return -1
+        for index in range(start, stop - len(pattern) + 1):
+            if values[index : index + len(pattern)] == pattern:
+                return index
+        return -1
+
+    def _build_assistant_masks(self, tokenized_messages):
+        """Build an answer-only mask from stable assistant message boundary tokens."""
+        input_ids = tokenized_messages["input_ids"]
+        attention_mask = tokenized_messages.get("attention_mask")
+        assistant_masks = torch.zeros_like(input_ids)
+
+        for row_index, row in enumerate(input_ids):
+            tokens = row.tolist()
+            if isinstance(attention_mask, torch.Tensor):
+                active = attention_mask[row_index].nonzero(as_tuple=False).flatten()
+                if active.numel() == 0:
+                    continue
+                sequence_start = int(active[0])
+                sequence_end = int(active[-1]) + 1
+            else:
+                sequence_start, sequence_end = 0, len(tokens)
+
+            for start_marker, end_markers in self._assistant_marker_specs():
+                search_from = sequence_start
+                while search_from < sequence_end:
+                    start = self._find_subsequence(
+                        tokens, start_marker, search_from, sequence_end
+                    )
+                    if start == -1:
+                        break
+                    content_start = start + len(start_marker)
+                    end_positions = [
+                        position
+                        for marker in end_markers
+                        if (
+                            position := self._find_subsequence(
+                                tokens, marker, content_start, sequence_end
+                            )
+                        )
+                        != -1
+                    ]
+                    content_end = min(end_positions) if end_positions else sequence_end
+                    if content_start < content_end:
+                        assistant_masks[row_index, content_start:content_end] = 1
+                    search_from = max(content_start + 1, content_end + 1)
+
+        return assistant_masks
+
+    def _pad_sequence_tensors(self, tokenized_messages):
+        """Pad every text-aligned tensor without truncating multimodal placeholders.
+
+        Qwen3-VL expands image/video markers into visual tokens.  Truncating that expanded
+        sequence can leave placeholders and pixel features inconsistent, so oversize examples
+        fail clearly instead.  Visual limits must be adjusted before tokenization.
+        """
+        if self.train_len is None:
+            return tokenized_messages
+
+        input_ids = tokenized_messages.get("input_ids")
+        if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+            raise ValueError("VLM processor did not return rank-2 input_ids.")
+        if input_ids.shape[1] > self.train_len:
+            raise ValueError(
+                f"VLM processor returned seq_len {input_ids.shape[1]} above "
+                f"training_seq_len {self.train_len}; reduce visual or assistant-text caps."
+            )
+
+        pad_width = self.train_len - input_ids.shape[1]
+        if pad_width == 0:
+            return tokenized_messages
+
+        sequence_length = input_ids.shape[1]
+        batch_size = input_ids.shape[0]
+        for key, value in tokenized_messages.items():
+            # Qwen3-VL's mm_token_type_ids must remain aligned with input_ids and
+            # attention_mask for multimodal RoPE computation.
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.ndim != 2
+                or value.shape != (batch_size, sequence_length)
+            ):
+                continue
+            pad_value = self.tokenizer.pad_token_id if key == "input_ids" else 0
+            padding = value.new_full((batch_size, pad_width), pad_value)
+            tokenized_messages[key] = torch.cat((value, padding), dim=1)
+
+        return tokenized_messages
+
+    def _apply_chat_template(self, examples):
+        """Tokenize VLM messages and generate answer-only spans when necessary."""
+        derive_masks_from_markers = bool(self._assistant_marker_specs())
         tokenized_messages = self.processor.apply_chat_template(
             examples,
             tokenize=True,
             return_tensors="pt",
             return_dict=True,
-            padding="max_length",
-            truncation=True,
-            max_length=self.train_len,
             add_generation_prompt=self.add_generation_prompt,
-            return_assistant_tokens_mask=self.answer_only_loss,
+            return_assistant_tokens_mask=(
+                self.answer_only_loss and not derive_masks_from_markers
+            ),
         )
+        tokenized_messages = self._pad_sequence_tensors(tokenized_messages)
+        if self.answer_only_loss and derive_masks_from_markers:
+            tokenized_messages["assistant_masks"] = self._build_assistant_masks(tokenized_messages)
+        return tokenized_messages
 
+    def _process_multimodal_sample(self, examples):
+        tokenized_messages = self._apply_chat_template(examples)
+
+        if self.return_labels:
+            input_ids = tokenized_messages["input_ids"]
+            labels = input_ids.new_full(input_ids.shape, IGNORE_TOKEN_ID)
+            if self.shift_labels:
+                labels[..., :-1] = input_ids[..., 1:]
+            else:
+                labels[:] = input_ids
+
+            if self.answer_only_loss:
+                assistant_mask = tokenized_messages.get("assistant_masks")
+                if not isinstance(assistant_mask, torch.Tensor) or not assistant_mask.any():
+                    labels[:] = IGNORE_TOKEN_ID
+                elif self.shift_labels:
+                    labels[..., :-1][assistant_mask[..., 1:] == 0] = IGNORE_TOKEN_ID
+                else:
+                    labels[assistant_mask == 0] = IGNORE_TOKEN_ID
+            tokenized_messages["labels"] = labels
+
+        # The mask has been folded into labels and is not a Hugging Face model input.
+        tokenized_messages.pop("assistant_masks", None)
         return tokenized_messages
 
     def __call__(self, examples):
-        """Call the VisionLanguageDataCollator."""
+        """Normalize media paths and collate a multimodal batch."""
         batch = []
 
         for example in examples:
@@ -379,22 +657,18 @@ class VisionLanguageDataCollator(LanguageDataCollator):
                 )
 
             copy_messages = copy.deepcopy(messages)
+            for message in copy_messages:
+                if isinstance(message["content"], str):
+                    message["content"] = [{"type": "text", "text": message["content"]}]
 
-            for msg in copy_messages:
-                if isinstance(msg["content"], str):
-                    msg["content"] = [{"type": "text", "text": msg["content"]}]
-
-                for ctn in msg["content"]:
-                    if ctn["type"] == "image" and "image" in ctn:
-                        ctn["image"] = os.path.abspath(
-                            os.path.join(self.local_image_path, ctn["image"])
+                for content in message["content"]:
+                    if content.get("type") == "image" and "image" in content:
+                        content["image"] = os.path.abspath(
+                            os.path.join(self.local_image_path, content["image"])
                         )
-                    # If any value in ctn is None, delete that key
-                    # HF dataloader add Nones to align keys. Leads to error in processor.
-                    keys_to_delete = [k for k, v in ctn.items() if v is None]
-                    for k in keys_to_delete:
-                        del ctn[k]
-
+                    # Datasets may add None-valued keys while aligning heterogeneous rows.
+                    for key in [key for key, value in content.items() if value is None]:
+                        del content[key]
             batch.append(copy_messages)
 
         return self._process_multimodal_sample(batch)

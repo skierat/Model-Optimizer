@@ -74,6 +74,7 @@ Draft model components:
 import logging
 
 import torch
+import transformers
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config as _Qwen3Config
@@ -93,6 +94,13 @@ from .modeling_fakebase import _BASE_MODEL_PATHS, _EMBED_TOKENS_PATHS, _LM_HEAD_
 logger = logging.getLogger(__name__)
 
 __all__ = ["HFDFlashModel"]
+
+
+def _expand_qwen3_video_grid_thw(video_grid_thw: torch.Tensor) -> torch.Tensor:
+    """Return the per-frame video grid representation expected by Transformers 5.3 RoPE."""
+    expanded_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+    expanded_grid_thw[:, 0] = 1
+    return expanded_grid_thw
 
 
 def _dpace_position_weights(
@@ -166,6 +174,50 @@ class HFDFlashModel(DFlashModel):
             getattr(self.config, "text_config", None)
             or getattr(self.config, "llm_config", None)
             or self.config
+        )
+
+    def _legacy_qwen3_vl_position_ids(
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        inputs_embeds,
+        model_kwargs,
+    ):
+        """Precompute Qwen3-VL positions for the Transformers 5.3 video-grid contract.
+
+        In 5.3, Qwen3-VL RoPE consumes one grid row per temporal frame, while the visual
+        encoder consumes one row per video.  Keep the original grid for the encoder and pass
+        positions computed with a frame-expanded copy to the top-level model.
+        """
+        if (
+            position_ids is not None
+            or getattr(self.config, "model_type", None) != "qwen3_vl"
+            or not transformers.__version__.startswith("5.3.")
+        ):
+            return position_ids
+
+        video_grid_thw = model_kwargs.get("video_grid_thw")
+        mm_token_type_ids = model_kwargs.get("mm_token_type_ids")
+        backbone = getattr(self, "model", None)
+        compute_position_ids = getattr(backbone, "compute_3d_position_ids", None)
+        if (
+            not isinstance(video_grid_thw, torch.Tensor)
+            or video_grid_thw.numel() == 0
+            or mm_token_type_ids is None
+            or not callable(compute_position_ids)
+        ):
+            return position_ids
+
+        return compute_position_ids(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            image_grid_thw=model_kwargs.get("image_grid_thw"),
+            video_grid_thw=_expand_qwen3_video_grid_thw(video_grid_thw),
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            mm_token_type_ids=mm_token_type_ids,
         )
 
     def _find_base_model_parts(self):
@@ -531,6 +583,15 @@ class HFDFlashModel(DFlashModel):
         - Label alignment: position k predicts token at anchor+k
         - Optional loss decay weighting
         """
+        position_ids = self._legacy_qwen3_vl_position_ids(
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            inputs_embeds,
+            kwargs,
+        )
+
         if not self.training:
             if self.dflash_offline:
                 raise RuntimeError(
@@ -575,12 +636,49 @@ class HFDFlashModel(DFlashModel):
                 base_outputs.logits = self._base_model_lm_head(out_hiddens)
             target_hidden = base_outputs.target_hidden
         else:
-            # TODO: For co-training the base model, remove no_grad and eval() switch.
+            # Multimodal models need the top-level conditional-generation forward so their
+            # image/video features are inserted before the language model runs.  Keep the
+            # long-standing narrow call for text-only models.
+            multimodal_keys = {
+                "pixel_values",
+                "pixel_values_videos",
+                "image_grid_thw",
+                "video_grid_thw",
+                "image_sizes",
+                "images",
+                "videos",
+            }
+            use_top_level_forward = any(kwargs.get(key) is not None for key in multimodal_keys)
             with torch.no_grad():
-                raw_outputs = super().forward(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
+                if use_top_level_forward:
+                    base_forward_kwargs = dict(kwargs)
+                    # Training-only data keys are not accepted by Hugging Face model forwards.
+                    base_forward_kwargs.pop("assistant_masks", None)
+                    base_forward_kwargs.pop("loss_mask", None)
+                    raw_outputs = super().forward(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        inputs_embeds=inputs_embeds,
+                        use_cache=False,
+                        output_attentions=output_attentions,
+                        output_hidden_states=True,
+                        cache_position=cache_position,
+                        return_dict=True,
+                        **base_forward_kwargs,
+                    )
+                else:
+                    raw_outputs = super().forward(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True,
+                    )
+
+            if not getattr(raw_outputs, "hidden_states", None):
+                raise RuntimeError(
+                    "The base model did not return hidden states required for DFlash training. "
+                    "Ensure its top-level multimodal forward supports output_hidden_states=True."
                 )
             offset = 1
             selected = [raw_outputs.hidden_states[lid + offset] for lid in self.target_layer_ids]
@@ -611,8 +709,16 @@ class HFDFlashModel(DFlashModel):
         n_blocks = anchor_positions.shape[1]
 
         if n_blocks == 0 or not block_keep_mask.any():
-            # Zero loss that still flows through dflash_module for DDP gradient sync
-            dummy = self.dflash_module.fc.weight.sum() * 0.0
+            # Keep all trainable draft parameters in the graph so DDP can reduce a rank
+            # that receives an all-masked answer-only batch.
+            dummy = sum(
+                (
+                    parameter.reshape(-1)[0] * 0.0
+                    for parameter in self.dflash_module.parameters()
+                    if parameter.requires_grad
+                ),
+                torch.zeros((), device=device),
+            )
             return ModelOutput(loss=dummy, logits=base_outputs.logits, train_acc=[[0.0]])
 
         # 4. Build draft inputs
